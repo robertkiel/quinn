@@ -325,8 +325,16 @@ impl RecvStream {
                 return Poll::Ready(Ok(Some(code)));
             }
 
-            let received_reset = conn.inner.recv_stream(self.stream).received_reset();
-            match received_reset {
+            if conn
+                .inner
+                .recv_stream(self.stream)
+                .is_finished()
+                .unwrap_or(true)
+            {
+                return Poll::Ready(Ok(None));
+            }
+
+            match conn.inner.recv_stream(self.stream).received_reset() {
                 Err(_) => Poll::Ready(Ok(None)),
                 Ok(Some(error_code)) => {
                     // Stream state has just now been freed, so the connection may need to issue new
@@ -338,10 +346,9 @@ impl RecvStream {
                     if let Some(e) = &conn.error {
                         return Poll::Ready(Err(e.clone().into()));
                     }
-                    // The peer has sent everything it ever will, so no reset can meaningfully
-                    // arrive any more. Waiting would hang: a finished stream produces no further
-                    // `StreamEvent::Readable`, and its state is only discarded once the
-                    // application has read the stream to completion, which it need never do.
+                    // The return value of `received_reset()` is ambiguous for `Ok(None)`.
+                    // Return early if the stream finished cleanly and no further data will
+                    // be sent.
                     if conn
                         .inner
                         .recv_stream(self.stream)
@@ -386,6 +393,7 @@ impl RecvStream {
     {
         use proto::ReadError::*;
         use std::collections::hash_map::Entry;
+
         if self.all_data_read {
             return Poll::Ready(Ok(None));
         }

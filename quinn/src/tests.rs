@@ -1156,6 +1156,118 @@ async fn recv_stream_cancel_stop_drop() {
     );
 }
 
+/// Test that dropping a `RecvStream` after cancelling `received_reset` and then reading the
+/// stream to EOF doesn't panic.
+///
+/// A cancelled `received_reset` leaves its waker registered in `blocked_readers`. Reading to EOF
+/// then sets `all_data_read`, at which point `RecvStream::drop` takes its fast path and asserts
+/// that no reader is still registered. Nothing removes the entry on that route by itself, so the
+/// invariant rests on the peer's FIN always producing a `StreamEvent::Readable` and on
+/// `received_reset` not parking once the stream is finished.
+#[tokio::test]
+async fn recv_stream_cancel_received_reset_drop() {
+    let _guard = subscribe();
+    let factory = EndpointFactory::new();
+    let server = {
+        let _guard = error_span!("server").entered();
+        factory.endpoint()
+    };
+    let server_addr = server.local_addr().unwrap();
+
+    let client = {
+        let _guard = error_span!("client").entered();
+        factory.endpoint()
+    };
+    let reset_cancelled = tokio::sync::SetOnce::new();
+    join!(
+        async {
+            let conn = server.accept().await.unwrap().await.unwrap();
+            let mut recv = conn.accept_uni().await.unwrap();
+            // Consume the data sent so far so that the stream is no longer readable, leaving
+            // `received_reset` to park and register a waker rather than resolving.
+            let mut buf = [0u8; 5];
+            recv.read_exact(&mut buf).await.unwrap();
+            assert_eq!(&buf, b"hello");
+            // Create a future to await a reset, poll it once, then immediately drop it
+            {
+                let fut = pin!(recv.received_reset());
+                let mut cx = Context::from_waker(Waker::noop());
+                assert!(fut.poll(&mut cx).is_pending());
+            }
+            reset_cancelled.set(()).unwrap();
+            // Reading to EOF must leave no registered reader behind for `drop` to trip over
+            assert_eq!(&recv.read_to_end(64).await.unwrap()[..], b"world");
+            drop(recv);
+        },
+        async {
+            let conn = client
+                .connect(server_addr, "localhost")
+                .unwrap()
+                .await
+                .unwrap();
+            let mut send = conn.open_uni().await.unwrap();
+            send.write_all(b"hello").await.unwrap();
+            // Don't finish the stream until the reset check has been cancelled, so that the
+            // waker is registered while the stream is still receiving.
+            reset_cancelled.wait().await;
+            send.write_all(b"world").await.unwrap();
+            send.finish().unwrap();
+            _ = send.stopped().await;
+        },
+    );
+}
+
+/// Test that `received_reset` yields `None` once the peer has cleanly finished a stream, even if
+/// the application never reads it.
+///
+/// `quinn-proto` only discards receive state once the stream has been read to completion, so for a
+/// finished-but-unread stream it keeps reporting "no reset". Without an explicit check for the
+/// finished state the future parks forever: the peer is done sending, so no further
+/// `StreamEvent::Readable` is ever emitted to wake it.
+#[tokio::test]
+async fn received_reset_on_finished_unread_stream() {
+    let _guard = subscribe();
+    let factory = EndpointFactory::new();
+    let server = {
+        let _guard = error_span!("server").entered();
+        factory.endpoint()
+    };
+    let server_addr = server.local_addr().unwrap();
+
+    let client = {
+        let _guard = error_span!("client").entered();
+        factory.endpoint()
+    };
+    let server_done = tokio::sync::SetOnce::new();
+    join!(
+        async {
+            let conn = server.accept().await.unwrap().await.unwrap();
+            let mut recv = conn.accept_uni().await.unwrap();
+            // Deliberately never read the stream. Arrival of the peer's FIN is what has to
+            // resolve this, so the timeout only trips if the fix regresses.
+            let reset = timeout(Duration::from_secs(1), recv.received_reset())
+                .await
+                .expect("received_reset should resolve once the peer finishes the stream")
+                .unwrap();
+            assert_eq!(reset, None);
+            server_done.set(()).unwrap();
+        },
+        async {
+            let conn = client
+                .connect(server_addr, "localhost")
+                .unwrap()
+                .await
+                .unwrap();
+            let mut send = conn.open_uni().await.unwrap();
+            send.write_all(b"hello").await.unwrap();
+            send.finish().unwrap();
+            // Hold the connection open so the server observes the finish rather than a
+            // connection error.
+            server_done.wait().await;
+        },
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn dropped_endpoint_cleans_up() {
     let _guard = subscribe();

@@ -158,6 +158,14 @@ impl Recv {
         matches!(self.state, RecvState::Recv { .. })
     }
 
+    /// Whether the peer has sent everything it ever will, fixing the stream's final size
+    ///
+    /// True once a frame carrying the FIN bit has been received. A stream that has been reset is
+    /// not considered finished, as the peer stopped short of sending the whole stream.
+    pub(super) fn is_finished(&self) -> bool {
+        matches!(self.state, RecvState::Recv { size: Some(_) })
+    }
+
     fn final_offset(&self) -> Option<u64> {
         match self.state {
             RecvState::Recv { size } => size,

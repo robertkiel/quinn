@@ -159,6 +159,30 @@ impl RecvStream<'_> {
         Ok(())
     }
 
+    /// Check whether the peer has finished sending on this stream
+    ///
+    /// True once a frame carrying the FIN bit has been received, fixing the stream's final size,
+    /// and no reset has been received. A peer that has finished a stream has already sent
+    /// everything it ever will, so the stream can no longer meaningfully be reset.
+    ///
+    /// Note that this reflects what the peer has sent, not what the application has read; stream
+    /// state is not discarded until the stream has been read to completion.
+    pub fn is_finished(&self) -> Result<bool, ClosedStream> {
+        // stream doesn't exist
+        let Some(recv) = self.state.recv.get(&self.id) else {
+            return Err(ClosedStream { _private: () });
+        };
+        // stream no longer open
+        let Some(s) = recv.as_ref().and_then(|s| s.as_open_recv()) else {
+            return Ok(false);
+        };
+        // stream got stopped by us
+        if s.stopped {
+            return Err(ClosedStream { _private: () });
+        }
+        Ok(s.is_finished())
+    }
+
     /// Check whether this stream has been reset by the peer, returning the reset error code if so
     ///
     /// After returning `Ok(Some(_))` once, stream state will be discarded and all future calls will
