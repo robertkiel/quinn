@@ -314,6 +314,7 @@ impl RecvStream {
     ///
     /// This operation is cancel-safe.
     pub async fn received_reset(&mut self) -> Result<Option<VarInt>, ResetError> {
+        use std::collections::hash_map::Entry;
         poll_fn(|cx| {
             let mut conn = self.conn.state.lock("RecvStream::reset");
             if self.is_0rtt && conn.check_0rtt().is_err() {
@@ -353,7 +354,14 @@ impl RecvStream {
                     // could introduce a dedicated channel to reduce the risk of spurious wakeups,
                     // but that increased complexity is probably not justified, as an application
                     // that is expecting a reset is not likely to receive large amounts of data.
-                    conn.blocked_readers.insert(self.stream, cx.waker().clone());
+                    match conn.blocked_readers.entry(self.stream) {
+                        Entry::Occupied(mut entry) => {
+                            entry.get_mut().clone_from(cx.waker());
+                        }
+                        Entry::Vacant(entry) => {
+                            entry.insert(cx.waker().clone());
+                        }
+                    }
                     Poll::Pending
                 }
             }
