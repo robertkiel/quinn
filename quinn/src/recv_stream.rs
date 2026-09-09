@@ -324,7 +324,8 @@ impl RecvStream {
                 return Poll::Ready(Ok(Some(code)));
             }
 
-            match conn.inner.recv_stream(self.stream).received_reset() {
+            let received_reset = conn.inner.recv_stream(self.stream).received_reset();
+            match received_reset {
                 Err(_) => Poll::Ready(Ok(None)),
                 Ok(Some(error_code)) => {
                     // Stream state has just now been freed, so the connection may need to issue new
@@ -335,6 +336,18 @@ impl RecvStream {
                 Ok(None) => {
                     if let Some(e) = &conn.error {
                         return Poll::Ready(Err(e.clone().into()));
+                    }
+                    // The peer has sent everything it ever will, so no reset can meaningfully
+                    // arrive any more. Waiting would hang: a finished stream produces no further
+                    // `StreamEvent::Readable`, and its state is only discarded once the
+                    // application has read the stream to completion, which it need never do.
+                    if conn
+                        .inner
+                        .recv_stream(self.stream)
+                        .is_finished()
+                        .unwrap_or(true)
+                    {
+                        return Poll::Ready(Ok(None));
                     }
                     // Resets always notify readers, since a reset is an immediate read error. We
                     // could introduce a dedicated channel to reduce the risk of spurious wakeups,
@@ -364,6 +377,7 @@ impl RecvStream {
         T: FnMut(&mut Chunks<'_>) -> ReadStatus<U>,
     {
         use proto::ReadError::*;
+        use std::collections::hash_map::Entry;
         if self.all_data_read {
             return Poll::Ready(Ok(None));
         }
@@ -392,22 +406,34 @@ impl RecvStream {
             ReadStatus::Readable(read) => Poll::Ready(Ok(Some(read))),
             ReadStatus::Finished(read) => {
                 self.all_data_read = true;
+                // Clean up shared state that might be left over from a cancelled read or
+                // `received_reset` operation, so `drop` doesn't have to
+                conn.blocked_readers.remove(&self.stream);
                 Poll::Ready(Ok(read))
             }
             ReadStatus::Failed(read, Blocked) => match read {
-                Some(val) => Poll::Ready(Ok(Some(val))),
                 None => {
                     if let Some(ref x) = conn.error {
                         return Poll::Ready(Err(ReadError::ConnectionLost(x.clone())));
                     }
-                    conn.blocked_readers.insert(self.stream, cx.waker().clone());
+                    match conn.blocked_readers.entry(self.stream) {
+                        Entry::Occupied(mut entry) => {
+                            entry.get_mut().clone_from(&cx.waker());
+                        }
+                        Entry::Vacant(entry) => {
+                            entry.insert(cx.waker().clone());
+                        }
+                    }
                     Poll::Pending
                 }
+                val => Poll::Ready(Ok(val)),
             },
             ReadStatus::Failed(read, Reset(error_code)) => match read {
                 None => {
                     self.all_data_read = true;
                     self.reset = Some(error_code);
+                    // As above, don't leave a waker behind for a stream nobody can read again
+                    conn.blocked_readers.remove(&self.stream);
                     Poll::Ready(Err(ReadError::Reset(error_code)))
                 }
                 done => {
