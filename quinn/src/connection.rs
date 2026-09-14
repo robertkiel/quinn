@@ -153,12 +153,17 @@ impl Connecting {
     /// [`Session`](proto::crypto::Session). For the default `rustls` session, the return value can
     /// be [`downcast`](Box::downcast) to a
     /// [`crypto::rustls::HandshakeData`](crate::crypto::rustls::HandshakeData).
+    ///
+    /// This operation is cancel-safe.
     pub async fn handshake_data(&mut self) -> Result<Box<dyn Any>, ConnectionError> {
         // Taking &mut self allows us to use a single oneshot channel rather than dealing with
         // potentially many tasks waiting on the same event. It's a bit of a hack, but keeps things
         // simple.
-        if let Some(x) = self.handshake_data_ready.take() {
+        if let Some(x) = self.handshake_data_ready.as_mut() {
             let _ = x.await;
+            // Once the data is ready, apply state changes. This prevents a panic due to
+            // inconsistent state when retrying a call to `handshake_data`.
+            self.handshake_data_ready = None;
         }
         let conn = self.conn.as_ref().unwrap();
         let inner = conn.state.lock("handshake");
@@ -494,7 +499,7 @@ impl Connection {
     /// datagram, in order of oldest to newest.
     pub fn send_datagram(&self, data: Bytes) -> Result<(), SendDatagramError> {
         let conn = &mut *self.0.state.lock("send_datagram");
-        if let Some(ref x) = conn.error {
+        if let Some(x) = &conn.error {
             return Err(SendDatagramError::ConnectionLost(x.clone()));
         }
         use proto::SendDatagramError::*;
@@ -809,7 +814,7 @@ fn poll_open<'a>(
     dir: Dir,
 ) -> Poll<Result<(ConnectionRef, StreamId, bool), ConnectionError>> {
     let mut state = conn.state.lock("poll_open");
-    if let Some(ref e) = state.error {
+    if let Some(e) = &state.error {
         return Poll::Ready(Err(e.clone()));
     } else if let Some(id) = state.inner.streams().open(dir) {
         let is_0rtt = state.inner.side().is_client() && state.inner.is_handshaking();
@@ -883,7 +888,7 @@ fn poll_accept<'a>(
         state.wake(); // To send additional stream ID credit
         drop(state); // Release the lock so clone can take it
         return Poll::Ready(Ok((conn.clone(), id, is_0rtt)));
-    } else if let Some(ref e) = state.error {
+    } else if let Some(e) = &state.error {
         return Poll::Ready(Err(e.clone()));
     }
     loop {
@@ -914,7 +919,7 @@ impl Future for ReadDatagram<'_> {
         // datagrams, which are necessarily finite, can be drained from a closed connection.
         if let Some(x) = state.inner.datagrams().recv() {
             return Poll::Ready(Ok(x));
-        } else if let Some(ref e) = state.error {
+        } else if let Some(e) = &state.error {
             return Poll::Ready(Err(e.clone()));
         }
         loop {
@@ -945,7 +950,7 @@ impl Future for SendDatagram<'_> {
     fn poll(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut this = self.project();
         let mut state = this.conn.state.lock("SendDatagram::poll");
-        if let Some(ref e) = state.error {
+        if let Some(e) = &state.error {
             return Poll::Ready(Err(SendDatagramError::ConnectionLost(e.clone())));
         }
         use proto::SendDatagramError::*;
