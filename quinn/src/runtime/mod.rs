@@ -1,12 +1,12 @@
 #[cfg(any(feature = "runtime-tokio", feature = "runtime-smol"))]
 use std::sync::Arc;
 use std::{
-    fmt::{self, Debug},
+    fmt::Debug,
     future::Future,
     io::{self, IoSliceMut},
     net::SocketAddr,
     pin::Pin,
-    task::{self, Context, Poll},
+    task::{Context, Poll},
     time::Duration,
 };
 
@@ -106,105 +106,6 @@ pub trait UdpSender: Send + Sync + Debug + 'static {
     }
 }
 
-pin_project_lite::pin_project! {
-    /// A helper for constructing [`UdpSender`]s from an underlying `Socket` type.
-    ///
-    /// This struct implements [`UdpSender`] if `MakeWritableFn` produces a `WritableFut`.
-    ///
-    /// Also serves as a trick, since `WritableFut` doesn't need to be a named future,
-    /// it can be an anonymous async block, as long as `MakeWritableFn` produces that
-    /// anonymous async block type.
-    ///
-    /// The `UdpSenderHelper` generic type parameters don't need to named, as it will be
-    /// used in its dyn-compatible form as a `Pin<Box<dyn UdpSender>>`.
-    struct UdpSenderHelper<Socket, MakeWritableFutFn, WritableFut> {
-        socket: Socket,
-        last_send_error: Option<Instant>,
-        make_writable_fut_fn: MakeWritableFutFn,
-        #[pin]
-        writable_fut: Option<WritableFut>,
-    }
-}
-
-impl<Socket, MakeWritableFutFn, WritableFut> Debug
-    for UdpSenderHelper<Socket, MakeWritableFutFn, WritableFut>
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("UdpSender")
-    }
-}
-
-impl<Socket, MakeWritableFutFn, WriteableFut>
-    UdpSenderHelper<Socket, MakeWritableFutFn, WriteableFut>
-{
-    /// Create helper that implements [`UdpSender`] from a socket.
-    ///
-    /// Additionally you need to provide what is essentially an async function
-    /// that resolves once the socket is write-ready.
-    ///
-    /// See also the bounds on this struct's [`UdpSender`] implementation.
-    #[cfg(any(feature = "runtime-smol", feature = "runtime-tokio",))]
-    fn new(inner: Socket, make_fut: MakeWritableFutFn) -> Self {
-        Self {
-            socket: inner,
-            last_send_error: None,
-            make_writable_fut_fn: make_fut,
-            writable_fut: None,
-        }
-    }
-}
-
-impl<Socket, MakeWritableFutFn, WritableFut> UdpSender
-    for UdpSenderHelper<Socket, MakeWritableFutFn, WritableFut>
-where
-    Socket: UdpSenderHelperSocket,
-    MakeWritableFutFn: Fn(&Socket) -> WritableFut + Send + Sync + 'static,
-    WritableFut: Future<Output = io::Result<()>> + Send + Sync + 'static,
-{
-    fn poll_send(
-        self: Pin<&mut Self>,
-        transmit: &Transmit<'_>,
-        cx: &mut Context<'_>,
-    ) -> Poll<io::Result<()>> {
-        let mut this = self.project();
-        loop {
-            if this.writable_fut.is_none() {
-                this.writable_fut
-                    .set(Some((this.make_writable_fut_fn)(this.socket)));
-            }
-            // We're forced to `unwrap` here because `Fut` may be `!Unpin`, which means we can't safely
-            // obtain an `&mut WritableFut` after storing it in `self.writable_fut` when `self` is already behind `Pin`,
-            // and if we didn't store it then we wouldn't be able to keep it alive between
-            // `poll_send` calls.
-            let result = task::ready!(this.writable_fut.as_mut().as_pin_mut().unwrap().poll(cx));
-
-            // Polling an arbitrary `Future` after it becomes ready is a logic error, so arrange for
-            // a new `Future` to be created on the next call.
-            this.writable_fut.set(None);
-
-            // If .writable() fails, propagate the error
-            result?;
-
-            match this.socket.try_send(transmit) {
-                // We thought the socket was writable, but it wasn't, then retry so that either another
-                // `writable().await` call determines that the socket is indeed not writable and
-                // registers us for a wakeup, or the send succeeds if this really was just a
-                // transient failure.
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
-                Err(e) => {
-                    log_sendmsg_error(this.last_send_error, &e, transmit);
-                    return Poll::Ready(Ok(()));
-                }
-                Ok(()) => return Poll::Ready(Ok(())),
-            }
-        }
-    }
-
-    fn max_transmit_segments(&self) -> usize {
-        self.socket.max_transmit_segments()
-    }
-}
-
 /// Limits I/O error logging to one message per minute.
 const IO_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -236,21 +137,6 @@ fn log_sendmsg_error(
         transmit.contents.len(),
         transmit.segment_size
     );
-}
-
-/// Parts of the [`UdpSender`] trait that aren't asynchronous or require storing wakers.
-///
-/// This trait is used by [`UdpSenderHelper`] to help construct [`UdpSender`]s.
-trait UdpSenderHelperSocket: Send + Sync + 'static {
-    /// Try to send a transmit, if the socket happens to be write-ready.
-    ///
-    /// If not write-ready, this is allowed to return [`std::io::ErrorKind::WouldBlock`].
-    ///
-    /// The [`UdpSenderHelper`] will use this to implement [`UdpSender::poll_send`].
-    fn try_send(&self, transmit: &Transmit<'_>) -> io::Result<()>;
-
-    /// See [`UdpSender::max_transmit_segments`].
-    fn max_transmit_segments(&self) -> usize;
 }
 
 /// Automatically select an appropriate runtime from those enabled at compile time

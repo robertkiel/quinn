@@ -12,7 +12,7 @@ use tokio::{
     time::{Sleep, sleep_until},
 };
 
-use super::{AsyncTimer, AsyncUdpSocket, Runtime, UdpSenderHelper, UdpSenderHelperSocket};
+use super::{AsyncTimer, AsyncUdpSocket, Runtime};
 
 /// A Quinn runtime for Tokio
 #[derive(Debug)]
@@ -54,26 +54,9 @@ struct UdpSocket {
     inner: Arc<udp::UdpSocketState>,
 }
 
-impl UdpSenderHelperSocket for UdpSocket {
-    fn max_transmit_segments(&self) -> usize {
-        self.inner.max_gso_segments()
-    }
-
-    fn try_send(&self, transmit: &udp::Transmit<'_>) -> io::Result<()> {
-        self.io.try_io(Interest::WRITABLE, || {
-            self.inner.try_send((&self.io).into(), transmit)
-        })?;
-
-        Ok(())
-    }
-}
-
 impl AsyncUdpSocket for UdpSocket {
     fn create_sender(&self) -> Pin<Box<dyn super::UdpSender>> {
-        Box::pin(UdpSenderHelper::new(self.clone(), |socket: &Self| {
-            let socket = socket.clone();
-            async move { socket.io.writable().await }
-        }))
+        Box::pin(TokioUdpSender::new(self.io.clone(), self.inner.clone()))
     }
 
     fn poll_recv(
@@ -107,5 +90,51 @@ impl AsyncUdpSocket for UdpSocket {
 
     fn max_receive_segments(&self) -> usize {
         self.inner.gro_segments()
+    }
+}
+
+#[derive(Debug)]
+struct TokioUdpSender {
+    last_send_error: Option<Instant>,
+    io: Arc<tokio::net::UdpSocket>,
+    inner: Arc<udp::UdpSocketState>,
+}
+
+impl TokioUdpSender {
+    fn new(socket: Arc<tokio::net::UdpSocket>, inner: Arc<udp::UdpSocketState>) -> Self {
+        Self {
+            last_send_error: None,
+            io: socket,
+            inner,
+        }
+    }
+}
+
+impl super::UdpSender for TokioUdpSender {
+    fn poll_send(
+        mut self: Pin<&mut Self>,
+        transmit: &udp::Transmit<'_>,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        loop {
+            ready!(self.io.poll_send_ready(cx)?);
+
+            match self.inner.try_send((&self.io).into(), transmit) {
+                // We thought the socket was writable, but it wasn't, then retry so that either another
+                // `poll_send_ready()` call determines that the socket is indeed not writable and
+                // registers us for a wakeup, or the send succeeds if this really was just a
+                // transient failure.
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                Err(e) => {
+                    super::log_sendmsg_error(&mut self.last_send_error, &e, transmit);
+                    return Poll::Ready(Ok(()));
+                }
+                Ok(()) => return Poll::Ready(Ok(())),
+            }
+        }
+    }
+
+    fn max_transmit_segments(&self) -> usize {
+        self.inner.max_gso_segments()
     }
 }
