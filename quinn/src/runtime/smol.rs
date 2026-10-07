@@ -39,24 +39,31 @@ impl AsyncTimer for Timer {
     }
 }
 
+#[derive(Debug)]
+struct UdpSocketInner {
+    inner: udp::UdpSocketState,
+    io: Async<std::net::UdpSocket>,
+}
+
 #[derive(Debug, Clone)]
 struct UdpSocket {
-    io: Arc<Async<std::net::UdpSocket>>,
-    inner: Arc<udp::UdpSocketState>,
+    socket: Arc<UdpSocketInner>,
 }
 
 impl UdpSocket {
     fn new(sock: std::net::UdpSocket) -> io::Result<Self> {
         Ok(Self {
-            inner: Arc::new(udp::UdpSocketState::new((&sock).into())?),
-            io: Arc::new(Async::new_nonblocking(sock)?),
+            socket: Arc::new(UdpSocketInner {
+                inner: udp::UdpSocketState::new((&sock).into())?,
+                io: Async::new_nonblocking(sock)?,
+            }),
         })
     }
 }
 
 impl AsyncUdpSocket for UdpSocket {
     fn create_sender(&self) -> Pin<Box<dyn UdpSender>> {
-        Box::pin(SmolUdpSender::new(self.io.clone(), self.inner.clone()))
+        Box::pin(SmolUdpSender::new(self.socket.clone()))
     }
 
     fn poll_recv(
@@ -66,8 +73,9 @@ impl AsyncUdpSocket for UdpSocket {
         meta: &mut [udp::RecvMeta],
     ) -> Poll<io::Result<usize>> {
         loop {
-            ready!(self.io.poll_readable(cx))?;
-            match self.inner.recv((&self.io).into(), bufs, meta) {
+            ready!(self.socket.io.poll_readable(cx))?;
+
+            match self.socket.inner.recv((&self.socket.io).into(), bufs, meta) {
                 Ok(res) => return Poll::Ready(Ok(res)),
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
                 Err(e) => return Poll::Ready(Err(e)),
@@ -76,31 +84,29 @@ impl AsyncUdpSocket for UdpSocket {
     }
 
     fn local_addr(&self) -> io::Result<std::net::SocketAddr> {
-        self.io.as_ref().as_ref().local_addr()
+        self.socket.io.as_ref().local_addr()
     }
 
     fn may_fragment(&self) -> bool {
-        self.inner.may_fragment()
+        self.socket.inner.may_fragment()
     }
 
     fn max_receive_segments(&self) -> usize {
-        self.inner.gro_segments()
+        self.socket.inner.gro_segments()
     }
 }
 
 #[derive(Debug)]
 struct SmolUdpSender {
     last_send_error: Option<Instant>,
-    io: Arc<Async<std::net::UdpSocket>>,
-    inner: Arc<udp::UdpSocketState>,
+    socket: Arc<UdpSocketInner>,
 }
 
 impl SmolUdpSender {
-    fn new(io: Arc<Async<std::net::UdpSocket>>, inner: Arc<udp::UdpSocketState>) -> Self {
+    fn new(socket: Arc<UdpSocketInner>) -> Self {
         Self {
             last_send_error: None,
-            io,
-            inner,
+            socket,
         }
     }
 }
@@ -112,9 +118,13 @@ impl UdpSender for SmolUdpSender {
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<()>> {
         loop {
-            ready!(self.io.poll_writable(cx)?);
+            ready!(self.socket.io.poll_writable(cx)?);
 
-            match self.inner.try_send((&self.io).into(), transmit) {
+            match self
+                .socket
+                .inner
+                .try_send((&self.socket.io).into(), transmit)
+            {
                 // We thought the socket was writable, but it wasn't, then retry so that either another
                 // `poll_send_ready()` call determines that the socket is indeed not writable and
                 // registers us for a wakeup, or the send succeeds if this really was just a
@@ -130,6 +140,6 @@ impl UdpSender for SmolUdpSender {
     }
 
     fn max_transmit_segments(&self) -> usize {
-        self.inner.max_gso_segments()
+        self.socket.inner.max_gso_segments()
     }
 }

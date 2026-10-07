@@ -29,8 +29,10 @@ impl Runtime for TokioRuntime {
 
     fn wrap_udp_socket(&self, sock: std::net::UdpSocket) -> io::Result<Box<dyn AsyncUdpSocket>> {
         Ok(Box::new(UdpSocket {
-            inner: Arc::new(udp::UdpSocketState::new((&sock).into())?),
-            io: Arc::new(tokio::net::UdpSocket::from_std(sock)?),
+            socket: Arc::new(UdpSocketInner {
+                inner: udp::UdpSocketState::new((&sock).into())?,
+                io: tokio::net::UdpSocket::from_std(sock)?,
+            }),
         }))
     }
 
@@ -48,15 +50,20 @@ impl AsyncTimer for Sleep {
     }
 }
 
+#[derive(Debug)]
+struct UdpSocketInner {
+    io: tokio::net::UdpSocket,
+    inner: udp::UdpSocketState,
+}
+
 #[derive(Debug, Clone)]
 struct UdpSocket {
-    io: Arc<tokio::net::UdpSocket>,
-    inner: Arc<udp::UdpSocketState>,
+    socket: Arc<UdpSocketInner>,
 }
 
 impl AsyncUdpSocket for UdpSocket {
     fn create_sender(&self) -> Pin<Box<dyn super::UdpSender>> {
-        Box::pin(TokioUdpSender::new(self.io.clone(), self.inner.clone()))
+        Box::pin(TokioUdpSender::new(self.socket.clone()))
     }
 
     fn poll_recv(
@@ -66,9 +73,10 @@ impl AsyncUdpSocket for UdpSocket {
         meta: &mut [udp::RecvMeta],
     ) -> Poll<io::Result<usize>> {
         loop {
-            ready!(self.io.poll_recv_ready(cx))?;
-            match self.io.try_io(Interest::READABLE, || {
-                self.inner.recv((&self.io).into(), bufs, meta)
+            ready!(self.socket.io.poll_recv_ready(cx))?;
+
+            match self.socket.io.try_io(Interest::READABLE, || {
+                self.socket.inner.recv((&self.socket.io).into(), bufs, meta)
             }) {
                 Ok(res) => return Poll::Ready(Ok(res)),
                 // `try_io` clears readiness only for `WouldBlock`. Looping on any other
@@ -81,31 +89,29 @@ impl AsyncUdpSocket for UdpSocket {
     }
 
     fn local_addr(&self) -> io::Result<std::net::SocketAddr> {
-        self.io.local_addr()
+        self.socket.io.local_addr()
     }
 
     fn may_fragment(&self) -> bool {
-        self.inner.may_fragment()
+        self.socket.inner.may_fragment()
     }
 
     fn max_receive_segments(&self) -> usize {
-        self.inner.gro_segments()
+        self.socket.inner.gro_segments()
     }
 }
 
 #[derive(Debug)]
 struct TokioUdpSender {
     last_send_error: Option<Instant>,
-    io: Arc<tokio::net::UdpSocket>,
-    inner: Arc<udp::UdpSocketState>,
+    socket: Arc<UdpSocketInner>,
 }
 
 impl TokioUdpSender {
-    fn new(socket: Arc<tokio::net::UdpSocket>, inner: Arc<udp::UdpSocketState>) -> Self {
+    fn new(socket: Arc<UdpSocketInner>) -> Self {
         Self {
             last_send_error: None,
-            io: socket,
-            inner,
+            socket,
         }
     }
 }
@@ -117,9 +123,13 @@ impl super::UdpSender for TokioUdpSender {
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<()>> {
         loop {
-            ready!(self.io.poll_send_ready(cx)?);
+            ready!(self.socket.io.poll_send_ready(cx)?);
 
-            match self.inner.try_send((&self.io).into(), transmit) {
+            match self
+                .socket
+                .inner
+                .try_send((&self.socket.io).into(), transmit)
+            {
                 // We thought the socket was writable, but it wasn't, then retry so that either another
                 // `poll_send_ready()` call determines that the socket is indeed not writable and
                 // registers us for a wakeup, or the send succeeds if this really was just a
@@ -135,6 +145,6 @@ impl super::UdpSender for TokioUdpSender {
     }
 
     fn max_transmit_segments(&self) -> usize {
-        self.inner.max_gso_segments()
+        self.socket.inner.max_gso_segments()
     }
 }
